@@ -237,6 +237,116 @@ def run_leontief_cascade(csv_path: str, sector_code: str,
         converged=converged,
     )
 
+
+@st.cache_data(show_spinner=False)
+def run_ces_cascade(csv_path: str, sector_code: str, delta: float,
+                    sigma: float, eps: float = 1e-12) -> dict:
+    """
+    CES intermediate-aggregation cascade with elasticity of substitution σ.
+
+    Each sector j produces output via a CES aggregator over its
+    intermediate inputs:
+
+        Q_j = (sum_i γ_ij * z_ij^η)^(1/η),   η = (σ-1)/σ
+
+    Calibrated to reproduce the observed I-O flows at baseline (when all
+    relative prices equal 1), the weights become γ_ij = m_ij^(1-η) where
+    m_ij = a_ij / sum_k a_kj is the cost share of input i in j's
+    intermediate basket.
+
+    Under proportional rationing of available supply r_i, each sector's
+    feasible output scaling becomes
+
+        s_j = (sum_i m_ij * r_i^η)^(1/η)
+
+    Iterated to fixed point. Limits:
+        σ → 0   : Leontief (min rule)         — strict no-substitution
+        σ = 1   : Cobb-Douglas (geometric mean) — unit-elastic
+        σ → ∞   : linear (arithmetic mean)     — perfect substitution
+
+    Realistic short-run values for energy-economy substitution: σ ∈ [0.1, 0.5].
+    Long-run / textbook values: σ ∈ [0.5, 2.0].
+
+    The sigma=0 case dispatches to the strict Leontief code path for
+    numerical stability.
+    """
+    # σ = 0 → use the strict Leontief implementation
+    if sigma < 0.01:
+        return run_leontief_cascade(csv_path, sector_code, delta)
+
+    c = load_country(csv_path)
+    sectors, Z, IMPO, OUTPUT, VALU = (
+        c["sectors"], c["Z"], c["IMPO"], c["OUTPUT"], c["VALU"]
+    )
+    n = len(sectors)
+    x = OUTPUT - IMPO
+    safe_x = np.where(x > 0, x, 1.0)
+    A = Z / safe_x[None, :]                  # technical coefficients
+
+    # Normalised cost shares within each sector's intermediate basket
+    col_sum = A.sum(axis=0)
+    safe_col = np.where(col_sum > 1e-12, col_sum, 1.0)
+    M = np.where(col_sum > 1e-12, A / safe_col, 0.0)
+
+    j = sectors.index(sector_code)
+    imports_j = float(-IMPO[j])
+    imp_share = np.where(x > 0, -IMPO / x, 0.0)
+    dom_share = np.where(x > 0,  OUTPUT / x, 0.0)
+
+    shock = np.zeros(n)
+    shock[j] = delta
+
+    eta = (sigma - 1.0) / sigma
+    s = np.ones(n)
+    converged = False
+
+    for _ in range(500):
+        r = dom_share * s + (1.0 - shock) * imp_share
+        r_safe = np.maximum(r, 1e-12)
+        s_new = np.ones(n)
+
+        for jj in range(n):
+            mj = M[:, jj]
+            mask = mj > eps
+            if not mask.any():
+                continue
+            mu = mj[mask]
+            ru = r_safe[mask]
+            if abs(eta) < 1e-6:
+                # Cobb-Douglas: s = exp(sum m * log r)
+                s_new[jj] = min(1.0, np.exp(np.sum(mu * np.log(ru))))
+            else:
+                inner = max(np.sum(mu * ru**eta), 1e-300)
+                s_new[jj] = min(1.0, inner**(1.0 / eta))
+
+        # Shocked sector capped by its own supply availability
+        s_new[j] = min(s_new[j], r[j])
+
+        if np.max(np.abs(s_new - s)) < 1e-9:
+            converged = True
+            s = s_new
+            break
+        s = s_new
+
+    dx = (s - 1.0) * x
+    dGDP = (s - 1.0) * VALU
+    pct_supply = 100.0 * (s - 1.0)
+
+    return dict(
+        sectors=sectors,
+        dx=dx, pct_supply=pct_supply, dGDP=dGDP,
+        VALU=VALU, x=x, s=s,
+        n_collapsed=int((s < 0.5).sum()),
+        shock=float(-delta * imports_j),
+        imports_j=imports_j,
+        total_dx=float(dx.sum()),
+        total_dGDP=float(dGDP.sum()),
+        share_GDP=float(100.0 * dGDP.sum() / VALU.sum())
+                  if VALU.sum() > 0 else 0.0,
+        converged=converged,
+        sigma=sigma,
+    )
+
 # ----------------------------------------------------------------------------
 # 3. Plot
 # ----------------------------------------------------------------------------
@@ -360,12 +470,12 @@ st.set_page_config(
 
 st.title("OECD ICIO — supply-shock simulator")
 st.caption(
-    "Two complementary models on the same data. "
-    "**Ghosh** propagates a partial import shock through fixed allocation "
-    "shares — *lower bound* (free input substitution). "
-    "**Leontief min-rule** uses $x_j = \\min_i (z_{ij}/a_{ij})$ — the "
-    "scarcest input determines each sector's output, *upper bound* (no "
-    "substitution at all)."
+    "Three models on the same data. **Ghosh** — fixed allocation shares, "
+    "free divisibility (*lower bound*). **CES** — calibrated CES "
+    "intermediate aggregation with tunable elasticity σ (*the realistic "
+    "middle*). **Leontief min-rule** — $x_j = \\min_i (z_{ij}/a_{ij})$, "
+    "no substitution (*upper bound*). The CES collapses to Ghosh as "
+    "σ → ∞ in the *use* sense, and to Leontief as σ → 0."
 )
 
 # --- sidebar controls ---
@@ -410,25 +520,46 @@ with st.sidebar:
     model = st.radio(
         "Model",
         options=["Ghosh (linear, lower bound)",
+                 "CES intermediate aggregation (calibrated, tunable)",
                  "Leontief min-rule (strict, upper bound)"],
-        index=0,
+        index=1,
         help=(
-            "**Ghosh**: cuts a fraction of the sector's *imports* and "
-            "propagates linearly via fixed allocation shares. Output is "
-            "treated as continuously divisible — *lower bound*.\n\n"
-            "**Leontief min-rule**: $x_j = \\min_i (z_{ij}/a_{ij})$. Each "
-            "sector can produce only as much as its scarcest input "
-            "allows. Cascading scale-down through the I-O network — "
-            "*upper bound*."
+            "**Ghosh**: forward propagation through fixed allocation "
+            "shares, free output divisibility — *lower bound*.\n\n"
+            "**CES**: each sector aggregates its intermediates with "
+            "elasticity σ. σ→0 recovers Leontief; σ=1 is Cobb-Douglas; "
+            "σ→∞ approaches linear. Calibrated to the observed I-O "
+            "table at baseline. The right tool for *playing with "
+            "substitutability*.\n\n"
+            "**Leontief min-rule**: $x_j = \\min_i (z_{ij}/a_{ij})$. "
+            "Strictest possible reading — *upper bound*."
         ),
     )
     is_leontief = model.startswith("Leontief")
+    is_ces = model.startswith("CES")
 
     delta_pct = st.slider(
         "Shock magnitude (% of imports cut)",
         min_value=0, max_value=100, value=30, step=5,
     )
     delta = delta_pct / 100.0
+
+    if is_ces:
+        sigma = st.slider(
+            "Elasticity of substitution σ",
+            min_value=0.0, max_value=5.0, value=0.5, step=0.05,
+            help=(
+                "How easily sectors can substitute one intermediate for "
+                "another.\n\n"
+                "• σ = 0   — Leontief (no substitution, min rule)\n"
+                "• σ = 0.1–0.5 — short-run energy substitution\n"
+                "• σ = 1   — Cobb-Douglas (textbook benchmark)\n"
+                "• σ = 1–3 — medium-run, common CGE values\n"
+                "• σ → ∞   — linear, arithmetic-mean cascade"
+            ),
+        )
+    else:
+        sigma = 0.5  # default value, unused outside CES mode
 
     top_n = st.slider("Sectors shown in chart", 8, 25, 12)
 
@@ -441,6 +572,8 @@ with st.sidebar:
 # --- run the model ---
 if is_leontief:
     res = run_leontief_cascade(csv_path, sector, delta)
+elif is_ces:
+    res = run_ces_cascade(csv_path, sector, delta, sigma=sigma)
 else:
     res = run_ghosh_shock(csv_path, sector, delta)
 country_name = ISO3_TO_NAME.get(country, country)
@@ -472,6 +605,12 @@ if is_leontief:
         f"{delta_pct}% cut to {sector} "
         f"({SECTOR_NAMES.get(sector, sector)}) imports"
     )
+elif is_ces:
+    st.subheader(
+        f"{country_name} — CES (σ = {sigma:.2f}), "
+        f"{delta_pct}% cut to {sector} "
+        f"({SECTOR_NAMES.get(sector, sector)}) imports"
+    )
 else:
     st.subheader(
         f"{country_name} — Ghosh propagation, "
@@ -496,8 +635,12 @@ with st.expander("Sectoral results table", expanded=False):
     st.dataframe(table, use_container_width=True, hide_index=True)
 
     csv_bytes = table.to_csv(index=False).encode("utf-8")
-    suffix = (f"leontief_d{delta_pct}" if is_leontief
-              else f"ghosh_d{delta_pct}")
+    if is_leontief:
+        suffix = f"leontief_d{delta_pct}"
+    elif is_ces:
+        suffix = f"ces_s{int(sigma*100):03d}_d{delta_pct}"
+    else:
+        suffix = f"ghosh_d{delta_pct}"
     st.download_button(
         label="Download results as CSV",
         data=csv_bytes,
@@ -562,15 +705,55 @@ mathematical Leontief result with epsilon = 0 typically collapses to
 nearly all sectors at $\delta = 100\%$ because every sector uses some
 small amount of energy.
 
-### Reading the bounds together
+### CES intermediate aggregation (calibrated middle)
 
-$$\text{Ghosh GDP loss} \;\le\; \text{realised GDP loss} \;\le\; \text{Leontief GDP loss}$$
+The Leontief min-rule is the strictest reading of the I-O table. The
+realistic middle ground replaces the min with a CES aggregator over
+intermediates:
 
-The realistic medium-run cost of a sustained energy disruption sits
-between these. A CGE model with calibrated substitution elasticities is
-the right tool to pin down where exactly between the bounds — but the
-bounds themselves are computed from the I-O table alone, with no
-calibration freedom.
+$$Q_j = \left(\sum_i \gamma_{ij}\, z_{ij}^\eta\right)^{1/\eta}, \quad \eta = \frac{\sigma - 1}{\sigma}$$
+
+where $\sigma$ is the elasticity of substitution. Calibrating to the
+observed flows at baseline (where all relative prices equal 1) pins down
+the weights:
+
+$$\gamma_{ij} = m_{ij}^{\,1-\eta}, \qquad m_{ij} = \frac{a_{ij}}{\sum_k a_{kj}}$$
+
+i.e. the cost share of input $i$ in sector $j$'s intermediate basket.
+Under proportional rationing of available supply $r_i$, the resulting
+sectoral output scaling is
+
+$$s_j = \left(\sum_i m_{ij}\, r_i^{\eta}\right)^{1/\eta}$$
+
+iterated to fixed point through the network as before.
+
+**Limits.** As $\sigma \to 0$ the CES collapses to the min function and
+recovers the strict Leontief result. At $\sigma = 1$ it is Cobb-Douglas
+($s_j = \prod_i r_i^{m_{ij}}$ — geometric mean weighted by cost share).
+As $\sigma \to \infty$ it approaches the linear (arithmetic-mean)
+aggregator — every sector's output scales with the cost-share-weighted
+average of its inputs' availability.
+
+**Choosing σ.** This is where the literature lives and where the
+results live or die. Estimated short-run elasticities for energy-economy
+substitution are typically in the $\sigma \in [0.1, 0.5]$ range. Medium-
+run / long-run textbook values used in CGE studies are $\sigma \in
+[0.5, 2.0]$. Energy is famously *less* substitutable than other
+intermediates over short horizons, so for an oil-shock scenario the
+short-run end of this range is appropriate. **Treat σ as the principal
+sensitivity dimension** and report a range, not a point.
+
+### Reading the three models together
+
+$$\text{Ghosh GDP loss} \;\le\; \text{CES GDP loss}(\sigma) \;\le\; \text{Leontief GDP loss}$$
+
+The CES result depends on σ: low-σ approaches Leontief, high-σ falls
+toward the bottom of the band. A CGE model with calibrated substitution
+elasticities is the right tool to pin down a single σ; this app lets
+you see the whole curve. Useful comparisons: Ghosh vs CES at σ=2 tells
+you how much of the difference is the *use*-vs-*allocation* framing;
+CES at σ=0.3 vs Leontief tells you how much the strict no-substitution
+assumption matters.
 
 ### GDP translation
 
