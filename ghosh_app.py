@@ -153,113 +153,35 @@ def run_ghosh_shock(csv_path: str, sector_code: str, delta: float) -> dict:
 
 
 @st.cache_data(show_spinner=False)
-def run_hem_extraction(csv_path: str, sector_code: str, threshold: float) -> dict:
+def run_leontief_cascade(csv_path: str, sector_code: str,
+                         delta: float, eps: float = 1e-6) -> dict:
     """
-    Hypothetical-Extraction cascade with a Leontief criticality threshold.
+    Strict Leontief min-rule cascade.
 
-    Asks: "If sector j is removed entirely, which other sectors must shut
-    down because their dependence on j (or on something that itself
-    depends on j) exceeds τ of their input cost?"
+    Production function
+    -------------------
+        x_j = min_i ( z_ij / a_ij )
 
-    Algorithm
-    ---------
-    1.  Build technical coefficients A = Z / x_j (column-wise share).
-    2.  Mark j_shock as dead.
-    3.  Repeat until stable: any sector with a dead supplier whose input
-        coefficient exceeds τ also dies.
-    4.  Dead sectors lose 100% of their output and value added; other
-        sectors are assumed to substitute away (no smooth Ghosh-style
-        partial loss).
+    Each sector can produce only as much as its scarcest input allows.
+    Apply the shock as a supply cap on the chosen sector's *imports*:
+    available supply of input i drops to
 
-    The threshold τ is the substitutability cushion. τ → 0 means every
-    input is essential (catastrophic upper bound). τ → ∞ means only the
-    shocked sector itself dies (trivial bound). Realistic energy-economy
-    values are 1–10%.
+        r_i = (OUTPUT_i / x_i) * s_i + (IMPORTS_i / x_i) * (1 - δ_i)
 
-    Returns a dict matching the Ghosh-output schema so the chart and table
-    rendering can be reused.
-    """
-    c = load_country(csv_path)
-    sectors, Z, OUTPUT, IMPO, VALU = (
-        c["sectors"], c["Z"], c["OUTPUT"], c["IMPO"], c["VALU"]
-    )
-    n = len(sectors)
-    x = OUTPUT - IMPO
-    safe_x = np.where(x > 0, x, 1.0)
-    A = Z / safe_x[None, :]      # technical coefficients (column-wise)
+    where s_i is sector i's output scaling and δ_i is the shock fraction
+    on its imports (non-zero only for the shocked sector). Sector j's
+    feasible scaling is then
 
-    j = sectors.index(sector_code)
-    dead = np.zeros(n, dtype=bool)
-    dead[j] = True
+        s_j = min over inputs i (with a_ij > eps) of r_i
 
-    # Iterative cascade
-    changed = True
-    while changed:
-        changed = False
-        for jj in range(n):
-            if dead[jj]:
-                continue
-            # If any dead sector supplies > τ of jj's inputs, jj dies
-            if np.any(dead & (A[:, jj] > threshold)):
-                dead[jj] = True
-                changed = True
+    Iterate until fixed point. The eps threshold filters out numerical
+    noise (rounding-artefact a_ij values like 1e-9); set to 0 for the
+    purely formal Leontief result.
 
-    # Dead sectors lose 100% of their supply and VA
-    dx = np.where(dead, -x, 0.0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        pct_supply = np.where(dead, -100.0, 0.0)
-    dGDP = np.where(dead, -VALU, 0.0)
-
-    return dict(
-        sectors=sectors,
-        dx=dx, pct_supply=pct_supply, dGDP=dGDP,
-        VALU=VALU, x=x,
-        dead=dead,
-        n_killed=int(dead.sum()),
-        shock=float(-x[j]),                 # full removal of shocked sector
-        imports_j=float(-IMPO[j]) if IMPO[j] < 0 else 0.0,
-        total_dx=float(dx.sum()),
-        total_dGDP=float(dGDP.sum()),
-        share_GDP=float(100.0 * dGDP.sum() / VALU.sum())
-                  if VALU.sum() > 0 else 0.0,
-    )
-
-
-@st.cache_data(show_spinner=False)
-def run_hem_extraction(csv_path: str, sector_code: str,
-                       threshold: float = 0.05) -> dict:
-    """
-    Hypothetical Extraction via supply-cascade Leontief.
-
-    Why supply-cascade rather than textbook HEM
-    -------------------------------------------
-    The textbook total-HEM formula (zero out row & column of A, recompute
-    Leontief) measures only **backward linkages**: the GDP that vanishes
-    if sector j had never bought any inputs from anyone. For an importing
-    country, this is small for B06 because Germany's domestic oil VA is
-    tiny — almost all is foreign value added passing through.
-
-    The user's actual intuition — "no oil = catastrophic GDP loss" — is a
-    **forward-linkage** question: which sectors **structurally depend on
-    sector j as an input**? A strict Leontief reading says: any sector
-    with a non-zero technical coefficient a[j,i] > 0 cannot operate
-    without j. That cascades to nearly the entire economy because every
-    sector uses *some* energy, however small.
-
-    Compromise — cascade with criticality threshold
-    -----------------------------------------------
-    A sector i shuts down if its input share from a dead sector exceeds
-    a `threshold` (e.g., 5%). Sectors that use only a trace amount of
-    the missing input are assumed to substitute or absorb the loss.
-
-    The threshold is a tunable parameter:
-      * threshold ≈ 0.005–0.02 → catastrophic cascade (everything dies)
-      * threshold ≈ 0.05      → energy-dependent core (~5% of GDP for oil)
-      * threshold ≈ 0.10      → only the most directly dependent sectors
-
-    This is a heuristic upper bound, not a CGE prediction. It captures
-    structural dependency under fixed Leontief inputs without claiming
-    the result is a literal forecast.
+    GDP impact
+    ----------
+        ΔGDP_j = (s_j - 1) · v_j
+        Δx_j   = (s_j - 1) · x_j
     """
     c = load_country(csv_path)
     sectors, Z, IMPO, OUTPUT, VALU = (
@@ -267,47 +189,52 @@ def run_hem_extraction(csv_path: str, sector_code: str,
     )
     n = len(sectors)
     x = OUTPUT - IMPO
-
     safe_x = np.where(x > 0, x, 1.0)
-    # Leontief technical coefficients: a[i,k] = inputs from i per unit output of k
     A = Z / safe_x[None, :]
 
     j = sectors.index(sector_code)
+    imports_j = float(-IMPO[j])
+    imp_share = np.where(x > 0, -IMPO / x, 0.0)
+    dom_share = np.where(x > 0,  OUTPUT / x, 0.0)
 
-    # Iterative cascade: a sector dies if any of its critical inputs is dead
-    alive = np.ones(n, dtype=bool)
-    alive[j] = False
-    for _ in range(n + 1):
-        new_alive = alive.copy()
-        for i in range(n):
-            if not new_alive[i]:
-                continue
-            for k in range(n):
-                if not alive[k] and A[k, i] > threshold:
-                    new_alive[i] = False
-                    break
-        if np.array_equal(new_alive, alive):
+    shock = np.zeros(n)
+    shock[j] = delta
+
+    s = np.ones(n)
+    converged = False
+    for _ in range(500):
+        r = dom_share * s + (1 - shock) * imp_share
+        s_new = np.ones(n)
+        # Vectorized "min over rows where A[i,j] > eps" per column j
+        for jj in range(n):
+            uses = A[:, jj] > eps
+            if uses.any():
+                s_new[jj] = min(1.0, r[uses].min())
+        # Shocked sector itself capped by its own supply availability
+        s_new[j] = min(s_new[j], r[j])
+        if np.max(np.abs(s_new - s)) < 1e-10:
+            converged = True
+            s = s_new
             break
-        alive = new_alive
+        s = s_new
 
-    # Output of dead sectors goes to zero; alive sectors unchanged
-    dx = np.where(alive, 0.0, -x)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        pct_supply = np.where(x > 0, 100.0 * dx / x, 0.0)
-        dGDP = np.where(x > 0, dx * VALU / x, 0.0)
+    dx = (s - 1.0) * x
+    dGDP = (s - 1.0) * VALU
+    pct_supply = 100.0 * (s - 1.0)
 
     return dict(
         sectors=sectors,
         dx=dx, pct_supply=pct_supply, dGDP=dGDP,
-        VALU=VALU, x=x,
-        shock=-x[j], imports_j=-IMPO[j],
-        n_killed=int((~alive).sum()),
-        threshold=threshold,
+        VALU=VALU, x=x, s=s,
+        n_collapsed=int((s < 0.5).sum()),
+        # Same key names as Ghosh so the headline metrics row works
+        shock=float(-delta * imports_j),
+        imports_j=imports_j,
         total_dx=float(dx.sum()),
         total_dGDP=float(dGDP.sum()),
         share_GDP=float(100.0 * dGDP.sum() / VALU.sum())
                   if VALU.sum() > 0 else 0.0,
+        converged=converged,
     )
 
 # ----------------------------------------------------------------------------
@@ -321,12 +248,38 @@ def make_figure(res: dict, country_name: str, sector_code: str,
     dGDP       = res["dGDP"]
 
     labels = [f"{SECTOR_NAMES.get(s, s)} ({s})" for s in sectors]
-    order_pct = np.argsort(pct)[:top_n]
-    order_gdp = np.argsort(dGDP)[:top_n]
 
-    # gradient colour scales
-    reds  = [f"rgba({200-10*k},{50+5*k},{50+5*k},0.9)"   for k in range(top_n)]
-    blues = [f"rgba({50+5*k},{100+8*k},{200-10*k},0.9)"  for k in range(top_n)]
+    # Filter out sectors with negligible impact, then take top_n.
+    # argsort[:top_n] alone would pad the chart with zeros when fewer than
+    # top_n sectors are actually affected.
+    threshold = 1e-3                            # mn USD; ignore noise
+    affected_pct = np.where(pct < -1e-6)[0]
+    affected_gdp = np.where(dGDP < -threshold)[0]
+    order_pct = affected_pct[np.argsort(pct[affected_pct])][:top_n]
+    order_gdp = affected_gdp[np.argsort(dGDP[affected_gdp])][:top_n]
+
+    # Gradient colour scales — clamped to the [0, 255] range so they never
+    # produce illegal rgba() values when top_n is large.
+    n1 = max(len(order_pct), 1)
+    n2 = max(len(order_gdp), 1)
+
+    def _reds(k, n):
+        # k = 0 (darkest) to k = n-1 (lightest)
+        t = k / max(n - 1, 1)
+        r = int(round(200 - 100*t))             # 200 → 100
+        g = int(round(50 + 100*t))              # 50  → 150
+        b = int(round(50 + 100*t))              # 50  → 150
+        return f"rgba({r},{g},{b},0.9)"
+
+    def _blues(k, n):
+        t = k / max(n - 1, 1)
+        r = int(round(50 + 100*t))              # 50  → 150
+        g = int(round(100 + 80*t))              # 100 → 180
+        b = int(round(200 - 50*t))              # 200 → 150
+        return f"rgba({r},{g},{b},0.9)"
+
+    reds  = [_reds(k, n1)  for k in range(n1)]
+    blues = [_blues(k, n2) for k in range(n2)]
 
     fig = make_subplots(
         rows=1, cols=2,
@@ -408,10 +361,11 @@ st.set_page_config(
 st.title("OECD ICIO — supply-shock simulator")
 st.caption(
     "Two complementary models on the same data. "
-    "**Ghosh** propagates a partial shock through fixed allocation shares — "
-    "*lower bound* on GDP loss. "
-    "**HEM cascade** removes the sector entirely under strict Leontief "
-    "input requirements — *upper bound*."
+    "**Ghosh** propagates a partial import shock through fixed allocation "
+    "shares — *lower bound* (free input substitution). "
+    "**Leontief min-rule** uses $x_j = \\min_i (z_{ij}/a_{ij})$ — the "
+    "scarcest input determines each sector's output, *upper bound* (no "
+    "substitution at all)."
 )
 
 # --- sidebar controls ---
@@ -455,42 +409,26 @@ with st.sidebar:
 
     model = st.radio(
         "Model",
-        options=["Ghosh (partial shock, lower bound)",
-                 "HEM cascade (full extraction, upper bound)"],
+        options=["Ghosh (linear, lower bound)",
+                 "Leontief min-rule (strict, upper bound)"],
         index=0,
         help=(
-            "**Ghosh**: cuts a fraction of the sector's *imports* and propagates "
-            "linearly via fixed allocation shares. Free output divisibility — "
-            "smooth losses, no shutdowns. *Lower bound* on GDP loss.\n\n"
-            "**HEM cascade**: removes the sector entirely; downstream sectors "
-            "shut down if their input dependency exceeds the threshold. Strict "
-            "Leontief — catches non-linear cascades. *Upper bound* on GDP loss."
+            "**Ghosh**: cuts a fraction of the sector's *imports* and "
+            "propagates linearly via fixed allocation shares. Output is "
+            "treated as continuously divisible — *lower bound*.\n\n"
+            "**Leontief min-rule**: $x_j = \\min_i (z_{ij}/a_{ij})$. Each "
+            "sector can produce only as much as its scarcest input "
+            "allows. Cascading scale-down through the I-O network — "
+            "*upper bound*."
         ),
     )
-    is_hem = model.startswith("HEM")
+    is_leontief = model.startswith("Leontief")
 
-    if is_hem:
-        threshold_pct = st.slider(
-            "Criticality threshold (% input share)",
-            min_value=1.0, max_value=20.0, value=5.0, step=0.5,
-            help=(
-                "A sector shuts down if it depends on a dead sector for more "
-                "than this share of its inputs. Lower threshold → more "
-                "cascading shutdowns. Try 1% for catastrophe, 5% for "
-                "energy-dependent core, 10% for only the most directly "
-                "dependent sectors."
-            ),
-        )
-        threshold = threshold_pct / 100.0
-        delta_pct = 100
-        delta = 1.0
-    else:
-        delta_pct = st.slider(
-            "Shock magnitude (% of imports cut)",
-            min_value=0, max_value=100, value=30, step=5,
-        )
-        delta = delta_pct / 100.0
-        threshold = 0.05  # placeholder, unused
+    delta_pct = st.slider(
+        "Shock magnitude (% of imports cut)",
+        min_value=0, max_value=100, value=30, step=5,
+    )
+    delta = delta_pct / 100.0
 
     top_n = st.slider("Sectors shown in chart", 8, 25, 12)
 
@@ -501,51 +439,44 @@ with st.sidebar:
     )
 
 # --- run the model ---
-if is_hem:
-    res = run_hem_extraction(csv_path, sector, threshold=threshold)
+if is_leontief:
+    res = run_leontief_cascade(csv_path, sector, delta)
 else:
     res = run_ghosh_shock(csv_path, sector, delta)
 country_name = ISO3_TO_NAME.get(country, country)
 
-# Warn if Ghosh sector has no meaningful imports
-if not is_hem and res["imports_j"] < 1.0:
+# Warn if the chosen sector has no meaningful imports
+if res["imports_j"] < 1.0:
     st.warning(
         f"**{country_name}** has essentially no imports of "
         f"{sector} ({SECTOR_NAMES.get(sector, sector)}) — "
-        f"the shock has no effect. Try a different sector or country."
+        f"the shock has no effect."
     )
 
 # --- headline metrics ---
 m1, m2, m3, m4 = st.columns(4)
-if is_hem:
-    m1.metric(
-        "Sector extracted",
-        f"{res['shock']/1000:,.2f} bn USD",
-        delta=f"{res['n_killed']} sectors die",
-        delta_color="inverse",
-    )
-else:
-    m1.metric(
-        "Direct shock",
-        f"{res['shock']/1000:,.2f} bn USD",
-        delta=f"{-delta_pct}% of imports",
-        delta_color="inverse",
-    )
+m1.metric(
+    "Direct shock",
+    f"{res['shock']/1000:,.2f} bn USD",
+    delta=f"{-delta_pct}% of {sector} imports",
+    delta_color="inverse",
+)
 m2.metric("Total supply loss",   f"{res['total_dx']/1000:,.2f} bn USD")
 m3.metric("Total GDP loss",      f"{res['total_dGDP']/1000:,.2f} bn USD")
 m4.metric("Share of GDP",        f"{res['share_GDP']:.3f}%")
 
 # --- chart ---
-if is_hem:
+if is_leontief:
     st.subheader(
-        f"{country_name} — HEM cascade extraction of "
-        f"{sector} ({SECTOR_NAMES.get(sector, sector)}), "
-        f"threshold = {threshold_pct:.1f}%"
+        f"{country_name} — Leontief min-rule, "
+        f"{delta_pct}% cut to {sector} "
+        f"({SECTOR_NAMES.get(sector, sector)}) imports"
     )
 else:
     st.subheader(
-        f"{country_name} — Ghosh propagation of a {delta_pct}% cut to "
-        f"{sector} ({SECTOR_NAMES.get(sector, sector)}) imports"
+        f"{country_name} — Ghosh propagation, "
+        f"{delta_pct}% cut to {sector} "
+        f"({SECTOR_NAMES.get(sector, sector)}) imports"
     )
 fig = make_figure(res, country_name, sector, delta, top_n=top_n)
 st.plotly_chart(fig, use_container_width=True)
@@ -558,12 +489,15 @@ with st.expander("Sectoral results table", expanded=False):
         "Δ supply (mn USD)":   res["dx"].round(1),
         "Δ supply (%)":        res["pct_supply"].round(3),
         "Δ GDP (mn USD)":      res["dGDP"].round(1),
-        "VA share":            (res["VALU"] / res["x"]).round(4),
+        "VA share":            np.where(
+            res["x"] > 0, res["VALU"] / res["x"], 0
+        ).round(4),
     }).sort_values("Δ GDP (mn USD)")
     st.dataframe(table, use_container_width=True, hide_index=True)
 
     csv_bytes = table.to_csv(index=False).encode("utf-8")
-    suffix = f"hem_thr{int(threshold_pct*10)}" if is_hem else f"ghosh_d{delta_pct}"
+    suffix = (f"leontief_d{delta_pct}" if is_leontief
+              else f"ghosh_d{delta_pct}")
     st.download_button(
         label="Download results as CSV",
         data=csv_bytes,
@@ -575,70 +509,88 @@ with st.expander("Sectoral results table", expanded=False):
 with st.expander("Method and caveats"):
     st.markdown(r"""
 ### Ghosh supply-side propagation (lower bound)
-Given the intermediate-flow matrix $Z$, total supply $x_i = \text{OUTPUT}_i + \text{IMPORTS}_i$,
-and the allocation matrix $B = \widehat{x}^{-1} Z$, the Ghosh inverse $G=(I-B)^{-1}$
+
+Given the intermediate-flow matrix $Z$, total supply
+$x_i = \text{OUTPUT}_i + \text{IMPORTS}_i$, and the allocation matrix
+$B = \widehat{x}^{-1} Z$, the Ghosh inverse $G=(I-B)^{-1}$
 maps a primary-supply shock $\Delta v$ into an output response
-$\Delta x' = \Delta v' G$. A fraction $\delta$ of the chosen sector's imports
-is removed: $\Delta v_j = -\delta \cdot \text{IMPORTS}_j$.
+$\Delta x' = \Delta v' G$. The diagonal of $G$ exceeds 1 because of
+feedback — downstream contraction reduces demand cycling back to the
+shocked sector.
 
-Why this is a *lower bound*: Ghosh assumes fixed allocation shares — buyers
-absorb whatever supply arrives in fixed proportions and continue producing
-scaled-down output. There is no threshold ("no oil → no refining") and no
-cascading shutdowns. For small shocks (a few percent) this is a fine local
-approximation; for large shocks it understates because real production
-functions are sharply non-linear at the boundaries.
+**Shock specification.** A fraction $\delta$ of the chosen sector's
+imports is removed: $\Delta v_j = -\delta \cdot \text{IMPORTS}_j$. Other
+primary inputs are held fixed.
 
-### HEM cascade (upper bound)
-Build the demand-side technical-coefficient matrix $A = Z\widehat{x}^{-1}$
-(column-wise division) where $a_{ij}$ is the input from sector $i$ needed per
-unit of sector $j$'s output.
+**Why Ghosh is a *lower* bound.** Ghosh treats outputs as continuously
+divisible, so a partial shock to one input produces a *partial* drop in
+output everywhere — never a binding constraint. In the limit of small
+shocks this is fine because production is roughly linear. For larger
+shocks the model systematically understates damage because it ignores
+the non-linearity of fixed-coefficient production.
 
-Run an iterative cascade. Sector $j$ is killed (output = 0). At each step,
-any *alive* sector $i$ that has $a_{kj} > \tau$ for some *dead* sector $k$
-is killed too, where $\tau$ is the criticality threshold. Iterate to fixed
-point.
+### Leontief min-rule (upper bound)
 
-The threshold $\tau$ matters a lot:
+The textbook Leontief production function:
 
-- $\tau \to 0$ — every sector with any oil dependency dies. For modern economies
-  this kills 95–99% of GDP because every sector uses some energy.
-- $\tau \approx 0.05$ — the "structurally oil-dependent core" emerges:
-  refining, petrochemicals, electricity, transport. ~5% of GDP for an
-  oil-importing economy.
-- $\tau \approx 0.10$ — only sectors with $\geq$10% input dependency die.
-  Typically a smaller cascade.
+$$x_j = \min_i \left( \frac{z_{ij}}{a_{ij}} \right)$$
 
-This is a *heuristic* upper bound, not a CGE prediction. It captures
-structural dependency under fixed Leontief inputs without claiming the
-result is a literal forecast.
+Each sector can produce only as much as its scarcest input allows. We
+implement this as a fixed-point iteration on sectoral output scaling
+$s_j$. Available supply of input $i$ is
 
-### Why textbook HEM isn't used here
-The standard total-HEM formula (zero out row & column of $A$, recompute
-$L$) measures only **backward linkages** — the GDP that vanishes if
-sector $j$ had never *demanded* inputs. For an importing country this is
-small for B06 because Germany's domestic oil VA is tiny; almost all is
-foreign value added. The user's intuition ("no oil = catastrophe") is a
-**forward-linkage** question, which the cascade implementation answers.
+$$r_i = \frac{\text{OUTPUT}_i}{x_i} \cdot s_i \;+\; \frac{\text{IMPORTS}_i}{x_i} \cdot (1-\delta_i)$$
 
-### GDP translation (both models)
-$\Delta\text{GDP}_j = \Delta x_j \cdot v_j / x_j$ where $v_j$ is the sector's
-domestic value added. Each USD of supply carries $v_j/x_j$ of domestic VA
-on average; the rest is intermediates and imported supply.
+where $\delta_i$ is the import-cut fraction (non-zero only for the
+shocked sector). Each sector's feasible scaling is then
+
+$$s_j = \min_{i \,:\, a_{ij} > 0} \, r_i$$
+
+Iterate to fixed point. Output and GDP changes follow as
+$\Delta x_j = (s_j - 1) \cdot x_j$ and $\Delta\text{GDP}_j = (s_j - 1) \cdot v_j$.
+
+**Why Leontief is an *upper* bound.** No substitution is allowed
+between inputs at all. If a sector loses 30% of its B06 supply and B06
+is binding, output drops by 30% even if that sector could in reality
+substitute coal, electricity, or imports from another origin for crude
+at some cost. This is the strictest possible reading of the I-O matrix
+as a production technology.
+
+**Numerical detail.** A tiny epsilon ($10^{-6}$) filters out rounding-
+artefact $a_{ij}$ values from the input requirements list. The pure
+mathematical Leontief result with epsilon = 0 typically collapses to
+nearly all sectors at $\delta = 100\%$ because every sector uses some
+small amount of energy.
 
 ### Reading the bounds together
-$$\text{Ghosh GDP loss} \;\le\; \text{realised GDP loss} \;\le\; \text{HEM cascade GDP loss}$$
 
-The realistic medium-run estimate for a sustained 100% oil disruption
-likely sits closer to HEM than to Ghosh — perhaps half-way — because
-adjustment costs, cascading shutdowns, and price spillovers dominate over
-quarters. A CGE model with non-zero substitution elasticities is the
-right tool to pin down where between the bounds the truth actually sits.
+$$\text{Ghosh GDP loss} \;\le\; \text{realised GDP loss} \;\le\; \text{Leontief GDP loss}$$
+
+The realistic medium-run cost of a sustained energy disruption sits
+between these. A CGE model with calibrated substitution elasticities is
+the right tool to pin down where exactly between the bounds — but the
+bounds themselves are computed from the I-O table alone, with no
+calibration freedom.
+
+### GDP translation
+
+$\Delta\text{GDP}_j = \Delta x_j \cdot v_j / x_j$ where $v_j$ is the
+sector's value added. Each USD of supply carries on average $v_j/x_j$ of
+domestic VA; the rest is intermediates and imported supply. Under
+Leontief, since $\Delta x_j / x_j = s_j - 1$, this simplifies to
+$\Delta\text{GDP}_j = (s_j - 1) \cdot v_j$.
 
 ### Other caveats
-1. Single-country ICIO with competitive imports — the shock cuts the
-   supply origin uniformly across all buyers; it can't tell you whose
-   firm gets less.
-2. No price channel, no SPR releases, no monetary or fiscal response.
-3. Total imports are cut, not just the share routed via a particular
-   geography. Hormuz-only / Russia-only requires the multi-country ICIO.
+
+1. **Single-country ICIO with competitive imports.** The shock cuts the
+   supply origin uniformly across all buyers. For Hormuz-only or
+   Russia-only scenarios you need the multi-country ICIO with
+   origin-disaggregated import flows.
+2. **No price channel.** Both models are pure quantity. For a sustained
+   oil shock the price/cost-push effect on inflation, real incomes, and
+   competitiveness is typically as large as the quantity effect — and
+   would need to be added separately (Leontief price model dual).
+3. **No behavioural response.** No SPR releases, no rerouting, no
+   monetary or fiscal policy. The numbers are *structural* impact
+   estimates.
 """)
